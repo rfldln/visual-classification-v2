@@ -109,7 +109,7 @@ export function VaultClient({ items }: Props) {
   const visibleItems = items.filter((i) => !optimisticDeleted.has(i.id));
 
   return (
-    <div>
+    <div className="h-full overflow-y-auto">
       {/* Header */}
       <div className="px-8 pt-8 pb-6 border-b border-border flex items-start justify-between gap-4">
         <div>
@@ -192,10 +192,10 @@ function VaultCard({
 }) {
   const [deleting, setDeleting] = useState(false);
 
-  async function handleDelete(e: React.MouseEvent) {
+  function handleDelete(e: React.MouseEvent) {
     e.stopPropagation();
     setDeleting(true);
-    await onDelete();
+    onDelete();
   }
 
   return (
@@ -295,9 +295,9 @@ function PreviewModal({
     }
   }
 
-  async function handleDelete() {
+  function handleDelete() {
     setDeleting(true);
-    await onDelete();
+    onDelete();
   }
 
   return (
