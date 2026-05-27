@@ -8,6 +8,7 @@
 
 // ── Database entity types (inferred from Drizzle schema) ──────────────────────
 export type { User, NewUser } from "@/lib/db/schema/users";
+export type { VaultItem, NewVaultItem } from "@/lib/db/schema/vault";
 
 // ── API response envelope ─────────────────────────────────────────────────────
 export interface ApiResponse<T = unknown> {

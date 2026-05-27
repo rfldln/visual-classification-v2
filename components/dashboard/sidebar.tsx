@@ -9,6 +9,8 @@ import {
   Clock,
   Settings,
   LogOut,
+  Archive,
+  Wand2,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Separator } from "@/components/ui/separator";
@@ -22,6 +24,8 @@ interface SidebarProps {
 const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/classify",  label: "Classify",  icon: Sparkles },
+  { href: "/generate",  label: "Generate",  icon: Wand2 },
+  { href: "/vault",     label: "Vault",     icon: Archive },
   { href: "/history",   label: "History",   icon: Clock },
   { href: "/settings",  label: "Settings",  icon: Settings },
 ] as const;
@@ -43,7 +47,7 @@ export function Sidebar({ user }: SidebarProps) {
 
   return (
     <aside
-      className="w-60 flex-shrink-0 flex flex-col h-full bg-foreground overflow-hidden"
+      className="w-60 shrink-0 flex flex-col h-full bg-foreground overflow-hidden"
       style={{
         backgroundImage: "radial-gradient(circle, oklch(1 0 0 / 8%) 1px, transparent 1px)",
         backgroundSize: "24px 24px",
@@ -74,7 +78,7 @@ export function Sidebar({ user }: SidebarProps) {
                   : "text-background/60 hover:text-background hover:bg-background/5"
               )}
             >
-              <Icon className="h-4 w-4 flex-shrink-0" />
+              <Icon className="h-4 w-4 shrink-0" />
               {label}
             </Link>
           );

@@ -10,3 +10,4 @@
  * tables in one pass regardless of how many domain files exist.
  */
 export * from "./users";
+export * from "./vault";

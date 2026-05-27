@@ -9,7 +9,7 @@ type Tab = "grok" | "ollama";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "grok",   label: "Grok" },
-  { id: "ollama", label: "Ollama" },
+  { id: "ollama", label: "Qwen" },
 ];
 
 export function ClassifyClient() {
