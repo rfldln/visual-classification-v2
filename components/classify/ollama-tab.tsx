@@ -112,11 +112,11 @@ export function OllamaTab() {
         form.set("end_count", String(endBlobs.length));
         form.append("frames", new File([sheet], "contact_sheet.jpg", { type: "image/jpeg" }));
         setFrameCountForStatus(allBlobs.length);
-        setStatus(`Asking Ollama (${allBlobs.length} frames / ${intervalSec}s)… This may take a moment.`);
+        setStatus(`Asking ${model} (${allBlobs.length} frames / ${intervalSec}s)… This may take a moment.`);
       } else {
         form.set("kind", "image");
         form.set("image", f, f.name);
-        setStatus("Asking Ollama…");
+        setStatus(`Asking ${model}…`);
       }
 
       const res = await fetch("/api/ollama-tag", { method: "POST", body: form });

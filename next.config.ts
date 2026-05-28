@@ -1,9 +1,13 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Prevents Webpack from trying to bundle the postgres-js native driver.
-  // It stays as a real Node.js require() at runtime.
   serverExternalPackages: ["postgres"],
+
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "75mb",
+    },
+  },
 
   images: {
     remotePatterns: [
