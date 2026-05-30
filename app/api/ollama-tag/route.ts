@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { callOllama, DEFAULT_OLLAMA_MODEL } from "@/lib/ollama-call";
+import { callOllama, submitRunPodJob, DEFAULT_OLLAMA_MODEL } from "@/lib/ollama-call";
 import { buildGrokSystemPrompt, filterGrokTags, parseGrokResponse } from "@/lib/grok";
 import { env } from "@/lib/env";
 
@@ -66,10 +66,38 @@ export async function POST(req: Request) {
           ].filter(Boolean).join(" ")
         : `Tag this image. Filename: "${filename}". JSON only.`;
 
+    const systemPrompt = buildGrokSystemPrompt();
+
+    // RunPod jobs can run for many minutes — longer than a Vercel function may live.
+    // Submit the job and return its id immediately; the browser polls /api/ollama-tag/status.
+    const rpKey = env.RUNPOD_API_KEY?.trim();
+    const rpEndpoint = env.RUNPOD_ENDPOINT_ID?.trim();
+    if (rpKey && rpEndpoint) {
+      const sub = await submitRunPodJob({
+        endpointId: rpEndpoint,
+        apiKey: rpKey,
+        model,
+        systemPrompt,
+        userText,
+        imageBase64s,
+      });
+      if (!sub.ok) {
+        return NextResponse.json({ error: `Ollama: ${sub.error}` }, { status: sub.status });
+      }
+      return NextResponse.json({
+        jobId: sub.jobId,
+        kind,
+        filename,
+        model,
+        frames: kind === "video" ? frameCount : undefined,
+      });
+    }
+
+    // Local Ollama (dev) — single streaming request, returns the full result inline.
     const result = await callOllama({
       baseUrl,
       model,
-      systemPrompt: buildGrokSystemPrompt(),
+      systemPrompt,
       userText,
       imageBase64s,
     });

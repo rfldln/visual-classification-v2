@@ -20,19 +20,18 @@ export const VIDEO_RESOLUTIONS: { value: VideoResolution; label: string }[] = [
   { value: "1080p", label: "1080p" },
 ];
 
-export type RefRole = "subject" | "environment" | "motion" | "audio";
+// Per BytePlus Seedance 2.0 docs: M2V multimodal roles
+export type RefRole = "reference_image" | "reference_video" | "reference_audio";
 
-// Per BytePlus docs: roles are scoped to media type
 export const REF_ROLES_BY_TYPE: Record<"image" | "video" | "audio", { value: RefRole; label: string }[]> = {
   image: [
-    { value: "subject",     label: "Subject"     },
-    { value: "environment", label: "Environment" },
+    { value: "reference_image", label: "Reference" },
   ],
   video: [
-    { value: "motion", label: "Motion" },
+    { value: "reference_video", label: "Reference" },
   ],
   audio: [
-    { value: "audio", label: "Audio" },
+    { value: "reference_audio", label: "Reference" },
   ],
 };
 

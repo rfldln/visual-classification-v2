@@ -20,6 +20,9 @@ lib/db/migrations/sql/
 # Uncomment to exclude from version control:
 # types/supabase.ts
 
+# Local session / shift notes
+task/
+
 # Misc
 .DS_Store
 *.pem

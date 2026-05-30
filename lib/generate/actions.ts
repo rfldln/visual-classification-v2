@@ -162,16 +162,21 @@ interface ResolvedRef {
   role: RefRole;
 }
 
-async function callOpenRouterVideo(
+interface VideoSubmitOptions {
+  multimodalRefs?: ResolvedRef[];
+  frameImages?: { url: string; frameType: "first_frame" | "last_frame" }[];
+  generateAudio?: boolean;
+}
+
+// Submits the generation job and returns the job reference immediately — NO polling.
+// The browser drives polling via pollVideoJob so no single request runs long (Vercel timeout).
+async function submitOpenRouterVideo(
   prompt: string,
   aspectRatio: AspectRatio,
   duration: VideoDuration,
   resolution: VideoResolution,
-  options?: {
-    multimodalRefs?: ResolvedRef[];
-    generateAudio?: boolean;
-  },
-): Promise<Buffer> {
+  options?: VideoSubmitOptions,
+): Promise<{ jobId: string | null; pollingUrl: string | null }> {
   const apiKey = env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not configured");
 
@@ -186,20 +191,38 @@ async function callOpenRouterVideo(
   };
 
   if (options?.multimodalRefs?.length) {
-    // M2V — references array with type/role/url
-    body.references = options.multimodalRefs.map((r) => ({
-      type: r.type,
-      url: r.url,
-      role: r.role,
+    // OpenRouter only accepts image_url type in input_references — split by media kind.
+    const imageRefs = options.multimodalRefs.filter((r) => r.type === "image");
+    const mediaRefs = options.multimodalRefs.filter((r) => r.type !== "image");
+
+    if (imageRefs.length) {
+      body.input_references = imageRefs.map((r) => ({
+        type: "image_url",
+        image_url: { url: r.url },
+        role: r.role,
+      }));
+    }
+
+    if (mediaRefs.length) {
+      // video/audio refs use BytePlus native format passed through to the provider
+      body.references = mediaRefs.map((r) => ({
+        type: r.type,
+        url: r.url,
+        role: r.role,
+      }));
+    }
+  }
+
+  if (options?.frameImages?.length) {
+    // I2V — first/last frame control. frame_images takes precedence over references.
+    body.frame_images = options.frameImages.map((f) => ({
+      type: "image_url",
+      image_url: { url: f.url },
+      frame_type: f.frameType,
     }));
   }
 
-  // Log without flooding base64
-  const logBody = { ...body };
-  if (typeof logBody.image_url === "string" && logBody.image_url.startsWith("data:")) {
-    logBody.image_url = "[base64 image]";
-  }
-  console.log("[OpenRouter/Video] POST /api/v1/videos", JSON.stringify(logBody));
+  console.log("[OpenRouter/Video] POST /api/v1/videos", JSON.stringify(body));
 
   const res = await fetch(OPENROUTER_VIDEO_URL, {
     method: "POST",
@@ -220,27 +243,20 @@ async function callOpenRouterVideo(
   }
 
   const json = (await res.json()) as VideoApiResponse;
-  console.log("[OpenRouter/Video] Response", res.status, JSON.stringify(json));
+  console.log("[OpenRouter/Video] Submit response", res.status, JSON.stringify(json));
 
   if (!res.ok || json.error) {
     throw new Error(json.error?.message ?? `OpenRouter video error (${res.status})`);
   }
 
-  // Try to extract a video URL from the immediate response
-  let videoUrl = extractVideoUrl(json);
-
-  // If not ready yet, poll using the polling_url from the response
-  if (!videoUrl && json.polling_url) {
-    videoUrl = await pollGeneration(json.polling_url, apiKey);
-  } else if (!videoUrl && json.id) {
-    // Fallback: reconstruct the polling URL from the id
-    videoUrl = await pollGeneration(`${OPENROUTER_VIDEO_URL}/${json.id}`, apiKey);
+  if (!json.id && !json.polling_url) {
+    throw new Error("Video service did not return a job reference");
   }
 
-  if (!videoUrl) {
-    throw new Error("No video URL returned from model");
-  }
+  return { jobId: json.id ?? null, pollingUrl: json.polling_url ?? null };
+}
 
+async function downloadVideo(videoUrl: string, apiKey: string): Promise<Buffer> {
   // unsigned_urls require the API key to download
   const videoRes = await fetch(videoUrl, {
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -271,36 +287,32 @@ function extractVideoUrl(json: VideoApiResponse): string | null {
   return null;
 }
 
-async function pollGeneration(pollingUrl: string, apiKey: string): Promise<string | null> {
-  const POLL_INTERVAL_MS = 5000;
-  const MAX_ATTEMPTS = 120; // 10 min
-
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-
-    const res = await fetch(pollingUrl, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-
-    if (!res.ok) continue;
-
-    const json = (await res.json()) as VideoApiResponse;
-    console.log(`[OpenRouter/Video] Poll #${attempt + 1}`, JSON.stringify(json).slice(0, 400));
-
-    if (json.status === "error" || json.error) {
-      throw new Error(json.error?.message ?? "Video generation failed on provider");
-    }
-
-    const url = extractVideoUrl(json);
-    if (url) return url;
-
-    // Done statuses that mean we won't get a URL
-    if (json.status === "failed" || json.status === "cancelled" || json.status === "expired") {
-      throw new Error(`Video generation ${json.status}`);
-    }
+// Single poll. Transient/network errors map to "pending" so the client keeps polling;
+// only an explicit provider error/terminal status returns "failed".
+async function pollOpenRouterVideoOnce(
+  pollingUrl: string,
+  apiKey: string,
+): Promise<{ status: "pending" | "completed" | "failed"; videoUrl?: string }> {
+  let res: Response;
+  try {
+    res = await fetch(pollingUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
+  } catch {
+    return { status: "pending" };
   }
+  if (!res.ok) return { status: "pending" };
 
-  throw new Error("Video generation timed out. Try again or reduce duration/resolution.");
+  const json = (await res.json()) as VideoApiResponse;
+  console.log("[OpenRouter/Video] Poll", JSON.stringify(json).slice(0, 400));
+
+  if (json.status === "error" || json.error) return { status: "failed" };
+
+  const url = extractVideoUrl(json);
+  if (url) return { status: "completed", videoUrl: url };
+
+  if (json.status === "failed" || json.status === "cancelled" || json.status === "expired") {
+    return { status: "failed" };
+  }
+  return { status: "pending" };
 }
 
 async function saveVideoToVault(userId: string, buffer: Buffer, fileName: string): Promise<void> {
@@ -323,6 +335,64 @@ async function saveVideoToVault(userId: string, buffer: Buffer, fileName: string
   });
 }
 
+// ── Video job lifecycle (submit → client-poll → finalize) ────────────────────
+//
+// Video generation can take minutes — far longer than a Vercel function may run.
+// So each start* action only SUBMITS and returns a job reference; the browser then
+// calls pollVideoJob on an interval. The poll that observes completion downloads the
+// video, saves it to the vault, and cleans up any temp references — all short requests.
+
+export type VideoStartResult =
+  | { ok: true; jobId: string | null; pollingUrl: string | null; tempKeys: string[] }
+  | { ok: false; error: string };
+
+export type VideoPollResult =
+  | { ok: true; status: "pending" }
+  | { ok: true; status: "completed"; dataUrl: string }
+  | { ok: false; error: string };
+
+export async function pollVideoJob(args: {
+  pollingUrl: string | null;
+  jobId: string | null;
+  prompt: string;
+  tempKeys: string[];
+}): Promise<VideoPollResult> {
+  const apiKey = env.OPENROUTER_API_KEY;
+  if (!apiKey) return { ok: false, error: "OPENROUTER_API_KEY is not configured" };
+
+  const url = args.pollingUrl ?? (args.jobId ? `${OPENROUTER_VIDEO_URL}/${args.jobId}` : null);
+  if (!url) return { ok: false, error: "Missing job reference" };
+
+  try {
+    const { status, videoUrl } = await pollOpenRouterVideoOnce(url, apiKey);
+
+    if (status === "failed") {
+      await cleanupTempReferences(args.tempKeys);
+      return { ok: false, error: "Video generation failed on provider" };
+    }
+    if (status !== "completed" || !videoUrl) {
+      return { ok: true, status: "pending" };
+    }
+
+    // Completed — download, persist, and clean up temp refs (all quick).
+    const supabase = await createSupabaseServerClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "Not authenticated" };
+
+    const buffer = await downloadVideo(videoUrl, apiKey);
+    const fileName = `${makeSlug(args.prompt)}-${Date.now()}.mp4`;
+    await saveVideoToVault(user.id, buffer, fileName);
+    revalidatePath("/vault");
+    await cleanupTempReferences(args.tempKeys);
+
+    const dataUrl = `data:video/mp4;base64,${buffer.toString("base64")}`;
+    return { ok: true, status: "completed", dataUrl };
+  } catch (err) {
+    await cleanupTempReferences(args.tempKeys);
+    return { ok: false, error: err instanceof Error ? err.message : "Video polling failed" };
+  }
+}
+
 // ── Text to Video ──────────────────────────────────────────────────────────────
 
 interface T2VParams {
@@ -333,17 +403,14 @@ interface T2VParams {
   generateAudio: boolean;
 }
 
-export async function generateTextToVideo(
-  params: T2VParams,
-): Promise<{ ok: true; dataUrl: string } | { ok: false; error: string }> {
+export async function startTextToVideo(params: T2VParams): Promise<VideoStartResult> {
   try {
     const supabase = await createSupabaseServerClient();
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "Not authenticated" };
     if (!params.prompt.trim()) return { ok: false, error: "Prompt is required" };
 
-    const slug = makeSlug(params.prompt);
-    const buffer = await callOpenRouterVideo(
+    const { jobId, pollingUrl } = await submitOpenRouterVideo(
       params.prompt.trim(),
       params.aspectRatio,
       params.duration,
@@ -351,12 +418,7 @@ export async function generateTextToVideo(
       { generateAudio: params.generateAudio },
     );
 
-    const fileName = `${slug}-${Date.now()}.mp4`;
-    await saveVideoToVault(user.id, buffer, fileName);
-    revalidatePath("/vault");
-
-    const dataUrl = `data:video/mp4;base64,${buffer.toString("base64")}`;
-    return { ok: true, dataUrl };
+    return { ok: true, jobId, pollingUrl, tempKeys: [] };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Video generation failed" };
   }
@@ -407,9 +469,7 @@ interface M2VParams {
   generateAudio: boolean;
 }
 
-export async function generateMultimodalToVideo(
-  params: M2VParams,
-): Promise<{ ok: true; dataUrl: string } | { ok: false; error: string }> {
+export async function startMultimodalToVideo(params: M2VParams): Promise<VideoStartResult> {
   const tempKeys: string[] = [];
 
   try {
@@ -433,37 +493,89 @@ export async function generateMultimodalToVideo(
     const resolvedRefs: ResolvedRef[] = [];
 
     for (const ref of params.refs) {
-      if (ref.type === "image") {
-        resolvedRefs.push({ type: "image", url: ref.dataBase64, role: ref.role });
-      } else {
-        // video or audio — upload to temp storage and get a signed URL
-        const [, b64] = ref.dataBase64.split(",");
-        const buffer = Buffer.from(b64, "base64");
-        const { signedUrl, storageKey } = await uploadTempReference(user.id, buffer, ref.mimeType);
-        tempKeys.push(storageKey);
-        resolvedRefs.push({ type: ref.type, url: signedUrl, role: ref.role });
-      }
+      // All ref types need a public HTTPS URL — upload to temp storage and get a signed URL.
+      // Temp refs are cleaned up by pollVideoJob once the job finishes.
+      const [, b64] = ref.dataBase64.split(",");
+      const buffer = Buffer.from(b64, "base64");
+      const { signedUrl, storageKey } = await uploadTempReference(user.id, buffer, ref.mimeType);
+      tempKeys.push(storageKey);
+      resolvedRefs.push({ type: ref.type, url: signedUrl, role: ref.role });
     }
 
-    const slug = makeSlug(params.prompt);
-    const buffer = await callOpenRouterVideo(
-      params.prompt.trim(),
+    // Convert UI labels @Image1/@Video1/@Audio1 → [Image 1]/[Video 1]/[Audio 1] (BytePlus prompt format)
+    const cleanPrompt = params.prompt.trim()
+      .replace(/@Image(\d+)/gi, (_, n) => `[Image ${n}]`)
+      .replace(/@Video(\d+)/gi, (_, n) => `[Video ${n}]`)
+      .replace(/@Audio(\d+)/gi, (_, n) => `[Audio ${n}]`);
+
+    const { jobId, pollingUrl } = await submitOpenRouterVideo(
+      cleanPrompt,
       params.aspectRatio,
       params.duration,
       params.resolution,
       { multimodalRefs: resolvedRefs, generateAudio: params.generateAudio },
     );
 
-    const fileName = `${slug}-${Date.now()}.mp4`;
-    await saveVideoToVault(user.id, buffer, fileName);
-    revalidatePath("/vault");
-
-    const dataUrl = `data:video/mp4;base64,${buffer.toString("base64")}`;
-    return { ok: true, dataUrl };
+    return { ok: true, jobId, pollingUrl, tempKeys };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : "Multimodal video generation failed" };
-  } finally {
     await cleanupTempReferences(tempKeys);
+    return { ok: false, error: err instanceof Error ? err.message : "Multimodal video generation failed" };
+  }
+}
+
+// ── Image to Video (first / last frame) ─────────────────────────────────────
+
+interface I2VParams {
+  prompt: string;
+  aspectRatio: AspectRatio;
+  duration: VideoDuration;
+  resolution: VideoResolution;
+  firstFrameBase64: string;
+  lastFrameBase64?: string;
+  generateAudio: boolean;
+}
+
+export async function startImageToVideo(params: I2VParams): Promise<VideoStartResult> {
+  const tempKeys: string[] = [];
+
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "Not authenticated" };
+    if (!params.prompt.trim()) return { ok: false, error: "Prompt is required" };
+    if (!params.firstFrameBase64) return { ok: false, error: "A first frame image is required" };
+
+    const frameImages: { url: string; frameType: "first_frame" | "last_frame" }[] = [];
+
+    const frames: { base64: string; frameType: "first_frame" | "last_frame" }[] = [
+      { base64: params.firstFrameBase64, frameType: "first_frame" },
+    ];
+    if (params.lastFrameBase64) {
+      frames.push({ base64: params.lastFrameBase64, frameType: "last_frame" });
+    }
+
+    for (const frame of frames) {
+      // Temp refs are cleaned up by pollVideoJob once the job finishes.
+      const [header, b64] = frame.base64.split(",");
+      const mimeType = header.match(/data:([^;]+);base64/)?.[1] ?? "image/png";
+      const buffer = Buffer.from(b64, "base64");
+      const { signedUrl, storageKey } = await uploadTempReference(user.id, buffer, mimeType);
+      tempKeys.push(storageKey);
+      frameImages.push({ url: signedUrl, frameType: frame.frameType });
+    }
+
+    const { jobId, pollingUrl } = await submitOpenRouterVideo(
+      params.prompt.trim(),
+      params.aspectRatio,
+      params.duration,
+      params.resolution,
+      { frameImages, generateAudio: params.generateAudio },
+    );
+
+    return { ok: true, jobId, pollingUrl, tempKeys };
+  } catch (err) {
+    await cleanupTempReferences(tempKeys);
+    return { ok: false, error: err instanceof Error ? err.message : "Image-to-video generation failed" };
   }
 }
 

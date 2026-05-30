@@ -5,7 +5,7 @@ import { buildGrokSystemPrompt, parseGrokResponse } from "@/lib/grok";
 import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 300;
 export const dynamic = "force-dynamic";
 
 const IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"]);

@@ -61,6 +61,8 @@ export function OllamaTab() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [frameCountForStatus, setFrameCountForStatus] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Bumped whenever a new file is picked or cleared, to abort any in-flight RunPod poll loop.
+  const pollRef = useRef(0);
 
   const labelById = useMemo(() => {
     const m = new Map<string, { label: string; description: string }>();
@@ -69,6 +71,7 @@ export function OllamaTab() {
   }, []);
 
   async function runTag(f: File) {
+    const token = pollRef.current;
     setStatus("Preparing…");
     setError(null);
     setResult(null);
@@ -120,21 +123,70 @@ export function OllamaTab() {
       }
 
       const res = await fetch("/api/ollama-tag", { method: "POST", body: form });
-      const json = (await res.json()) as OllamaResponse;
+      const json = (await res.json()) as OllamaResponse & { jobId?: string };
       if (!res.ok) {
         setError(json.error ?? `Request failed (${res.status})`);
-      } else {
-        if (frameDataUrls) json.frameImages = frameDataUrls;
-        setResult(json);
+        return;
       }
+
+      // RunPod async path — poll the status endpoint from the browser until done.
+      if (json.jobId) {
+        const jobId = json.jobId;
+        setStatus(`Processing on RunPod… (this can take a few minutes)`);
+        const POLL_MS = 3000;
+        while (pollRef.current === token) {
+          await new Promise((r) => setTimeout(r, POLL_MS));
+          if (pollRef.current !== token) return;
+
+          let sres: Response;
+          try {
+            sres = await fetch(`/api/ollama-tag/status?jobId=${encodeURIComponent(jobId)}`);
+          } catch {
+            continue; // transient — keep polling
+          }
+          if (pollRef.current !== token) return;
+          if (!sres.ok) continue;
+
+          const sjson = (await sres.json()) as OllamaResponse & { status?: string };
+          if (pollRef.current !== token) return;
+
+          if (sjson.status === "failed") {
+            setError(sjson.error ?? "RunPod job failed");
+            return;
+          }
+          if (sjson.status === "completed") {
+            setResult({
+              kind: json.kind,
+              filename: json.filename,
+              model: json.model,
+              frames: json.frames,
+              tags: sjson.tags ?? [],
+              summary: sjson.summary,
+              notes: sjson.notes,
+              raw: sjson.raw,
+              promptTokens: sjson.promptTokens,
+              completionTokens: sjson.completionTokens,
+              frameImages: frameDataUrls,
+            });
+            return;
+          }
+          // pending — keep polling
+        }
+        return; // superseded by a newer pick
+      }
+
+      // Local Ollama path — full result returned inline.
+      if (frameDataUrls) json.frameImages = frameDataUrls;
+      setResult(json);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (pollRef.current === token) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setStatus(null);
+      if (pollRef.current === token) setStatus(null);
     }
   }
 
   function onPick(f: File | null) {
+    pollRef.current++; // abort any in-flight poll from a previous file
     setResult(null);
     setError(null);
     setShowRaw(false);

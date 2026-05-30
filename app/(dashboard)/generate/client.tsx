@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
   Wand2,
   Image as ImageIcon,
@@ -11,14 +11,19 @@ import {
   Loader2,
   X,
   Upload,
+  RotateCcw,
+  Clapperboard,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   generateTextToImage,
   generateImageToImage,
-  generateTextToVideo,
-  generateMultimodalToVideo,
+  startTextToVideo,
+  startMultimodalToVideo,
+  startImageToVideo,
+  pollVideoJob,
+  type VideoStartResult,
 } from "@/lib/generate/actions";
 import {
   ASPECT_RATIOS,
@@ -36,7 +41,7 @@ import {
   type RefRole,
 } from "@/lib/generate/constants";
 
-type Mode = "t2i" | "i2i" | "t2v" | "m2v";
+type Mode = "t2i" | "i2i" | "t2v" | "m2v" | "i2v";
 type Status = "idle" | "generating" | "done" | "error";
 
 interface ResultItem { url: string; isVideo: boolean; }
@@ -55,14 +60,15 @@ const MAX_REFERENCES = 8;
 interface ModeConfig { label: string; icon: React.ElementType; isVideo: boolean; }
 
 const MODES: Record<Mode, ModeConfig> = {
-  t2i: { label: "Text to Image",  icon: Wand2,     isVideo: false },
-  i2i: { label: "Image to Image", icon: ImageIcon, isVideo: false },
-  t2v: { label: "Text to Video",  icon: Film,      isVideo: true  },
-  m2v: { label: "Multimodal",     icon: Layers,    isVideo: true  },
+  t2i: { label: "Text to Image",  icon: Wand2,         isVideo: false },
+  i2i: { label: "Image to Image", icon: ImageIcon,     isVideo: false },
+  t2v: { label: "Text to Video",  icon: Film,          isVideo: true  },
+  m2v: { label: "Multimodal",     icon: Layers,        isVideo: true  },
+  i2v: { label: "Image to Video", icon: Clapperboard,  isVideo: true  },
 };
 
 const IMAGE_MODES: Mode[] = ["t2i", "i2i"];
-const VIDEO_MODES: Mode[] = ["t2v", "m2v"];
+const VIDEO_MODES: Mode[] = ["t2v", "m2v", "i2v"];
 
 function getLabel(refs: MultimodalRef[], id: string): string {
   const ref = refs.find((r) => r.id === id);
@@ -79,6 +85,11 @@ export function GenerateClient() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<Mode>("t2i");
 
+  useEffect(() => {
+    const stored = localStorage.getItem("generate-mode") as Mode | null;
+    if (stored && stored in MODES) setMode(stored);
+  }, []);
+
   const [prompt, setPrompt] = useState("");
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
   const [count, setCount] = useState<GenerationCount>(1);
@@ -89,20 +100,30 @@ export function GenerateClient() {
   const [referenceImages, setReferenceImages] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [mRefs, setMRefs] = useState<MultimodalRef[]>([]);
+  const [firstFrame, setFirstFrame] = useState<string | null>(null);
+  const [lastFrame, setLastFrame] = useState<string | null>(null);
 
   const [status, setStatus] = useState<Status>("idle");
   const [results, setResults] = useState<ResultItem[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  // Bumped on every cancel (mode switch / reset / unmount) to abort any in-flight video poll loop.
+  const pollGenerationRef = useRef(0);
+  useEffect(() => () => { pollGenerationRef.current++; }, []);
+
   const isVideoMode = MODES[mode].isVideo;
 
   function switchMode(next: Mode) {
+    pollGenerationRef.current++; // abort any in-flight video poll
     setMode(next);
+    setPrompt("");
     setResults([]);
     setError(null);
     setStatus("idle");
     if (MODES[next].isVideo !== isVideoMode) setReferenceImages([]);
     if (next !== "m2v") setMRefs([]);
+    if (next !== "i2v") { setFirstFrame(null); setLastFrame(null); }
+    localStorage.setItem("generate-mode", next);
   }
 
   function addReferenceFiles(files: FileList | File[]) {
@@ -128,31 +149,75 @@ export function GenerateClient() {
   const canGenerate =
     !!prompt.trim() &&
     status !== "generating" &&
-    (mode === "t2i" || mode === "t2v" ? true : mode === "m2v" ? m2vHasNonAudio : referenceImages.length > 0);
+    (mode === "t2i" || mode === "t2v"
+      ? true
+      : mode === "m2v"
+        ? m2vHasNonAudio
+        : mode === "i2v"
+          ? !!firstFrame
+          : referenceImages.length > 0);
+
+  // Drives the submit → poll → finalize loop for a video job entirely from the browser,
+  // so no single server request runs long enough to hit Vercel's function timeout.
+  async function runVideoJob(start: VideoStartResult) {
+    if (!start.ok) { setError(start.error); setStatus("error"); return; }
+
+    const token = pollGenerationRef.current;
+    const POLL_INTERVAL_MS = 5000;
+
+    while (pollGenerationRef.current === token) {
+      const res = await pollVideoJob({
+        pollingUrl: start.pollingUrl,
+        jobId: start.jobId,
+        prompt,
+        tempKeys: start.tempKeys,
+      });
+
+      if (pollGenerationRef.current !== token) return; // cancelled while awaiting
+
+      if (!res.ok) { setError(res.error); setStatus("error"); return; }
+      if (res.status === "completed") {
+        setResults([{ url: res.dataUrl, isVideo: true }]);
+        setStatus("done");
+        return;
+      }
+
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+  }
 
   async function handleGenerate() {
     if (!canGenerate) return;
+    pollGenerationRef.current++; // supersede any previous in-flight job
     setStatus("generating");
     setResults([]);
     setError(null);
 
     if (mode === "t2v") {
-      const res = await generateTextToVideo({ prompt, aspectRatio, duration, resolution, generateAudio });
-      if (!res.ok) { setError(res.error); setStatus("error"); return; }
-      setResults([{ url: res.dataUrl, isVideo: true }]);
-      setStatus("done");
+      const start = await startTextToVideo({ prompt, aspectRatio, duration, resolution, generateAudio });
+      await runVideoJob(start);
       return;
     }
 
     if (mode === "m2v") {
-      const res = await generateMultimodalToVideo({
+      const start = await startMultimodalToVideo({
         prompt, aspectRatio, duration, resolution,
         refs: mRefs.map(({ type, dataBase64, role, mimeType }) => ({ type, dataBase64, role, mimeType })),
         generateAudio,
       });
-      if (!res.ok) { setError(res.error); setStatus("error"); return; }
-      setResults([{ url: res.dataUrl, isVideo: true }]);
-      setStatus("done");
+      await runVideoJob(start);
+      return;
+    }
+
+    if (mode === "i2v") {
+      if (!firstFrame) { setError("A first frame image is required"); setStatus("error"); return; }
+      const start = await startImageToVideo({
+        prompt, aspectRatio, duration, resolution,
+        firstFrameBase64: firstFrame,
+        lastFrameBase64: lastFrame ?? undefined,
+        generateAudio,
+      });
+      await runVideoJob(start);
       return;
     }
 
@@ -173,206 +238,239 @@ export function GenerateClient() {
     a.click();
   }
 
+  function resetParams() {
+    pollGenerationRef.current++; // abort any in-flight video poll
+    setPrompt("");
+    setAspectRatio("16:9");
+    setCount(1);
+    setDuration(5);
+    setResolution("720p");
+    setGenerateAudio(false);
+    setReferenceImages([]);
+    setMRefs([]);
+    setFirstFrame(null);
+    setLastFrame(null);
+    setResults([]);
+    setError(null);
+    setStatus("idle");
+  }
+
   const pct = ((duration - VIDEO_DURATION_MIN) / (VIDEO_DURATION_MAX - VIDEO_DURATION_MIN)) * 100;
 
   const hint =
     mode === "m2v" && !m2vHasNonAudio
       ? "Add at least one image or video reference to continue"
-      : mode === "i2i" && referenceImages.length === 0
-        ? "Upload a reference image to continue"
-        : isVideoMode
-          ? "30 – 120 s per generation  ·  ⌘ Enter"
-          : "⌘ Enter to generate";
+      : mode === "i2v" && !firstFrame
+        ? "Upload a first frame to continue"
+        : mode === "i2i" && referenceImages.length === 0
+          ? "Upload a reference image to continue"
+          : isVideoMode
+            ? "30 – 120 s per generation  ·  ⌘ Enter"
+            : "⌘ Enter to generate";
 
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-full flex-col overflow-hidden">
 
-      {/* ── Left: Mode selector ───────────────────────────────────────────── */}
-      <aside className="w-52 shrink-0 border-r border-border flex flex-col bg-card">
-        <div className="px-5 py-5 border-b border-border">
-          <p className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-widest">Generate</p>
+      {/* ── Mode tab header ───────────────────────────────────────────────── */}
+      <header className="shrink-0 h-12 border-b border-border bg-card flex items-center px-5 gap-5">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-widest pr-1.5">
+            Seedream 4.5
+          </span>
+          {IMAGE_MODES.map((m) => (
+            <ModeTab key={m} mode={m} active={mode === m} onSelect={switchMode} />
+          ))}
         </div>
 
-        <nav className="flex-1 px-2 py-5 space-y-5 overflow-y-auto">
-          <ModeGroup
-            label="Seedream 4.5"
-            badge="Image"
-            modes={IMAGE_MODES}
-            active={mode}
-            onSelect={switchMode}
-          />
-          <div className="mx-3 h-px bg-border" />
-          <ModeGroup
-            label="Seedance 2.0"
-            badge="Video"
-            modes={VIDEO_MODES}
-            active={mode}
-            onSelect={switchMode}
-          />
-        </nav>
-      </aside>
+        <div className="w-px h-5 bg-border shrink-0" />
 
-      {/* ── Right: Workspace ─────────────────────────────────────────────── */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-widest pr-1.5">
+            Seedance 2.0
+          </span>
+          {VIDEO_MODES.map((m) => (
+            <ModeTab key={m} mode={m} active={mode === m} onSelect={switchMode} />
+          ))}
+        </div>
+      </header>
 
-        {/* Controls */}
-        <div className="shrink-0 border-b border-border px-8 py-6 space-y-5 overflow-y-auto max-h-[60vh]">
+      {/* ── Body: controls left + output right ───────────────────────────── */}
+      <div className="flex-1 flex overflow-hidden">
 
-          {/* I2I reference images */}
-          {mode === "i2i" && (
-            <ControlBlock
-              label="Reference images"
-              badge={referenceImages.length > 0 ? `${referenceImages.length} / ${MAX_REFERENCES}` : undefined}
-            >
-              {referenceImages.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {referenceImages.map((src, i) => (
-                    <div key={i} className="relative group h-20 w-20 rounded-md overflow-hidden border border-border bg-muted flex-shrink-0">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={src} alt={`Reference ${i + 1}`} className="w-full h-full object-cover" />
+        {/* Controls column */}
+        <div className="w-96 shrink-0 flex flex-col border-r border-border bg-card">
+
+          {/* Scrollable form area */}
+          <div className="flex-1 overflow-y-auto px-6 py-6 space-y-6">
+
+            {/* I2I reference images */}
+            {mode === "i2i" && (
+              <ControlBlock
+                label="Reference images"
+                badge={referenceImages.length > 0 ? `${referenceImages.length} / ${MAX_REFERENCES}` : undefined}
+              >
+                {referenceImages.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {referenceImages.map((src, i) => (
+                      <div key={i} className="relative group h-20 w-20 rounded-md overflow-hidden border border-border bg-muted shrink-0">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={src} alt={`Reference ${i + 1}`} className="w-full h-full object-cover" />
+                        <button
+                          onClick={() => removeReference(i)}
+                          className="absolute top-0.5 right-0.5 rounded-full bg-black/60 p-0.5 text-white hover:bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </button>
+                      </div>
+                    ))}
+                    {referenceImages.length < MAX_REFERENCES && (
                       <button
-                        onClick={() => removeReference(i)}
-                        className="absolute top-0.5 right-0.5 rounded-full bg-black/60 p-0.5 text-white hover:bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={() => inputRef.current?.click()}
+                        className="h-20 w-20 shrink-0 rounded-md border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/50 flex items-center justify-center transition-colors"
                       >
-                        <X className="h-2.5 w-2.5" />
+                        <Upload className="h-4 w-4 text-muted-foreground" />
                       </button>
-                    </div>
-                  ))}
-                  {referenceImages.length < MAX_REFERENCES && (
-                    <button
-                      onClick={() => inputRef.current?.click()}
-                      className="h-20 w-20 flex-shrink-0 rounded-md border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/50 flex items-center justify-center transition-colors"
-                    >
-                      <Upload className="h-4 w-4 text-muted-foreground" />
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <DropZone
-                  isDragging={isDragging}
-                  hint={`up to ${MAX_REFERENCES} images`}
-                  onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-                  onDragLeave={() => setIsDragging(false)}
-                  onDrop={(e) => { e.preventDefault(); setIsDragging(false); addReferenceFiles(e.dataTransfer.files); }}
-                  onClick={() => inputRef.current?.click()}
-                />
-              )}
-              <input ref={inputRef} type="file" accept="image/*" multiple className="hidden"
-                onChange={(e) => { if (e.target.files) addReferenceFiles(e.target.files); }} />
-            </ControlBlock>
-          )}
-
-          {/* M2V multimodal refs — horizontal 3-column layout */}
-          {mode === "m2v" && (
-            <MultimodalRefPanel refs={mRefs} onChange={setMRefs} />
-          )}
-
-          {/* Prompt */}
-          <ControlBlock label="Prompt">
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder={
-                mode === "m2v"
-                  ? "e.g. @Image1 walking through @Image2 environment, motion like @Video1…"
-                  : "Describe what you want to create…"
-              }
-              rows={4}
-              className="w-full resize-none rounded-lg border border-input bg-background px-3.5 py-3 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring leading-relaxed"
-              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleGenerate(); }}
-            />
-          </ControlBlock>
-
-          {/* Settings row */}
-          <div className="flex flex-wrap gap-x-8 gap-y-4 items-start">
-            <ControlBlock label="Aspect ratio">
-              <div className="flex flex-wrap gap-1.5">
-                {ASPECT_RATIOS.map(({ value, label }) => (
-                  <PillButton key={value} active={aspectRatio === value} onClick={() => setAspectRatio(value)}>
-                    {label}
-                  </PillButton>
-                ))}
-              </div>
-            </ControlBlock>
-
-            {!isVideoMode && (
-              <ControlBlock label="Images">
-                <div className="flex gap-1.5">
-                  {([1, 2, 3, 4] as GenerationCount[]).map((n) => (
-                    <PillButton key={n} active={count === n} onClick={() => setCount(n)}>{n}</PillButton>
-                  ))}
-                </div>
+                    )}
+                  </div>
+                ) : (
+                  <DropZone
+                    isDragging={isDragging}
+                    hint={`up to ${MAX_REFERENCES} images`}
+                    onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                    onDragLeave={() => setIsDragging(false)}
+                    onDrop={(e) => { e.preventDefault(); setIsDragging(false); addReferenceFiles(e.dataTransfer.files); }}
+                    onClick={() => inputRef.current?.click()}
+                  />
+                )}
+                <input ref={inputRef} type="file" accept="image/*" multiple className="hidden"
+                  onChange={(e) => { if (e.target.files) addReferenceFiles(e.target.files); }} />
               </ControlBlock>
             )}
 
-            {isVideoMode && (
-              <>
-                <ControlBlock label={`Duration · ${duration}s`}>
-                  <div className="w-44 space-y-2">
-                    <input
-                      type="range"
-                      min={VIDEO_DURATION_MIN}
-                      max={VIDEO_DURATION_MAX}
-                      step={1}
-                      value={duration}
-                      onChange={(e) => setDuration(Number(e.target.value))}
-                      className={cn(
-                        "w-full h-2 rounded-full appearance-none cursor-pointer",
-                        "[&::-webkit-slider-thumb]:appearance-none",
-                        "[&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5",
-                        "[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-background",
-                        "[&::-webkit-slider-thumb]:shadow-[0_0_0_2.5px_var(--foreground)]",
-                        "[&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:transition-transform",
-                        "[&::-webkit-slider-thumb]:hover:scale-110",
-                        "[&::-moz-range-thumb]:w-5 [&::-moz-range-thumb]:h-5",
-                        "[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-background",
-                        "[&::-moz-range-thumb]:shadow-[0_0_0_2.5px_var(--foreground)]",
-                        "[&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer",
-                      )}
-                      style={{
-                        background: `linear-gradient(to right, var(--foreground) 0%, var(--foreground) ${pct}%, var(--border) ${pct}%, var(--border) 100%)`,
-                      }}
-                    />
-                    <div className="flex justify-between text-[10px] font-mono text-muted-foreground/50">
-                      <span>{VIDEO_DURATION_MIN}s</span>
-                      <span>{VIDEO_DURATION_MAX}s</span>
-                    </div>
-                  </div>
-                </ControlBlock>
+            {/* M2V multimodal refs */}
+            {mode === "m2v" && (
+              <MultimodalRefPanel refs={mRefs} onChange={setMRefs} />
+            )}
 
-                <ControlBlock label="Resolution">
+            {/* I2V first / last frame */}
+            {mode === "i2v" && (
+              <FrameUploadPanel
+                firstFrame={firstFrame}
+                lastFrame={lastFrame}
+                onFirstFrame={setFirstFrame}
+                onLastFrame={setLastFrame}
+              />
+            )}
+
+            {/* Prompt */}
+            <ControlBlock label="Prompt">
+              <textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                placeholder={
+                  mode === "m2v"
+                    ? "e.g. reference @Image1 for the subject, @Video1 for camera motion, @Audio1 for voice…"
+                    : mode === "i2v"
+                      ? "Describe the motion between your first and last frame…"
+                      : "Describe what you want to create…"
+                }
+                rows={4}
+                className="w-full resize-none rounded-lg border border-input bg-background px-3.5 py-3 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring leading-relaxed"
+                onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleGenerate(); }}
+              />
+            </ControlBlock>
+
+            {/* Settings */}
+            <div className="space-y-5">
+              <ControlBlock label="Aspect ratio">
+                <div className="flex flex-wrap gap-1.5">
+                  {ASPECT_RATIOS.map(({ value, label }) => (
+                    <PillButton key={value} active={aspectRatio === value} onClick={() => setAspectRatio(value)}>
+                      {label}
+                    </PillButton>
+                  ))}
+                </div>
+              </ControlBlock>
+
+              {!isVideoMode && (
+                <ControlBlock label="Images">
                   <div className="flex gap-1.5">
-                    {VIDEO_RESOLUTIONS.map(({ value, label }) => (
-                      <PillButton key={value} active={resolution === value} onClick={() => setResolution(value)}>
-                        {label}
-                      </PillButton>
+                    {([1, 2, 3, 4] as GenerationCount[]).map((n) => (
+                      <PillButton key={n} active={count === n} onClick={() => setCount(n)}>{n}</PillButton>
                     ))}
                   </div>
                 </ControlBlock>
+              )}
 
-                <ControlBlock label="Audio">
-                  <button
-                    onClick={() => setGenerateAudio((a) => !a)}
-                    className={cn(
-                      "flex items-center gap-2 rounded-md px-2.5 py-1 text-xs font-mono transition-all",
-                      generateAudio
-                        ? "bg-foreground text-background font-semibold"
-                        : "bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/70",
-                    )}
-                  >
-                    <Music className="h-3 w-3" />
-                    {generateAudio ? "On" : "Off"}
-                  </button>
-                  <p className="text-[10px] text-muted-foreground/60 mt-1.5">
-                    {generateAudio ? "Model generates audio output" : "No audio — avoids content filter issues"}
-                  </p>
-                </ControlBlock>
-              </>
-            )}
+              {isVideoMode && (
+                <>
+                  <ControlBlock label={`Duration · ${duration}s`}>
+                    <div className="w-full space-y-2">
+                      <input
+                        type="range"
+                        min={VIDEO_DURATION_MIN}
+                        max={VIDEO_DURATION_MAX}
+                        step={1}
+                        value={duration}
+                        onChange={(e) => setDuration(Number(e.target.value))}
+                        className={cn(
+                          "w-full h-2 rounded-full appearance-none cursor-pointer",
+                          "[&::-webkit-slider-thumb]:appearance-none",
+                          "[&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5",
+                          "[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-background",
+                          "[&::-webkit-slider-thumb]:shadow-[0_0_0_2.5px_var(--foreground)]",
+                          "[&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:transition-transform",
+                          "[&::-webkit-slider-thumb]:hover:scale-110",
+                          "[&::-moz-range-thumb]:w-5 [&::-moz-range-thumb]:h-5",
+                          "[&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-background",
+                          "[&::-moz-range-thumb]:shadow-[0_0_0_2.5px_var(--foreground)]",
+                          "[&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:cursor-pointer",
+                        )}
+                        style={{
+                          background: `linear-gradient(to right, var(--foreground) 0%, var(--foreground) ${pct}%, var(--border) ${pct}%, var(--border) 100%)`,
+                        }}
+                      />
+                      <div className="flex justify-between text-[10px] font-mono text-muted-foreground/50">
+                        <span>{VIDEO_DURATION_MIN}s</span>
+                        <span>{VIDEO_DURATION_MAX}s</span>
+                      </div>
+                    </div>
+                  </ControlBlock>
+
+                  <ControlBlock label="Resolution">
+                    <div className="flex gap-1.5">
+                      {VIDEO_RESOLUTIONS.map(({ value, label }) => (
+                        <PillButton key={value} active={resolution === value} onClick={() => setResolution(value)}>
+                          {label}
+                        </PillButton>
+                      ))}
+                    </div>
+                  </ControlBlock>
+
+                  <ControlBlock label="Audio">
+                    <button
+                      onClick={() => setGenerateAudio((a) => !a)}
+                      className={cn(
+                        "flex items-center gap-2 rounded-md px-2.5 py-1 text-xs font-mono transition-all",
+                        generateAudio
+                          ? "bg-foreground text-background font-semibold"
+                          : "bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/70",
+                      )}
+                    >
+                      <Music className="h-3 w-3" />
+                      {generateAudio ? "On" : "Off"}
+                    </button>
+                    <p className="text-[10px] text-muted-foreground/60 mt-1.5">
+                      {generateAudio ? "Model generates audio output" : "No audio — avoids content filter issues"}
+                    </p>
+                  </ControlBlock>
+                </>
+              )}
+            </div>
           </div>
 
-          {/* Generate */}
-          <div className="space-y-2">
+          {/* Sticky generate footer */}
+          <div className="shrink-0 px-6 py-4 border-t border-border space-y-2">
             <Button onClick={handleGenerate} disabled={!canGenerate} size="lg" className="w-full gap-2">
               {status === "generating"
                 ? <Loader2 className="h-4 w-4 animate-spin" />
@@ -383,12 +481,22 @@ export function GenerateClient() {
                 ? isVideoMode ? "Generating video…" : "Generating…"
                 : "Generate"}
             </Button>
-            <p className="text-[11px] text-muted-foreground/70 text-center">{hint}</p>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] text-muted-foreground/70 flex-1">{hint}</p>
+              <button
+                onClick={resetParams}
+                title="Reset parameters"
+                className="flex items-center gap-1 text-[11px] text-muted-foreground/40 hover:text-muted-foreground transition-colors shrink-0"
+              >
+                <RotateCcw className="h-2.5 w-2.5" />
+                Reset
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* Output */}
-        <div className="flex-1 overflow-y-auto">
+        {/* Output column */}
+        <div className="flex-1 overflow-y-auto bg-background">
           <OutputArea
             status={status}
             results={results}
@@ -405,7 +513,7 @@ export function GenerateClient() {
   );
 }
 
-// ── MultimodalRefPanel — horizontal 3-column in main area ─────────────────────
+// ── MultimodalRefPanel — 3-column layout inside controls column ───────────────
 
 function MultimodalRefPanel({ refs, onChange }: { refs: MultimodalRef[]; onChange: (refs: MultimodalRef[]) => void }) {
   const imgInput = useRef<HTMLInputElement>(null);
@@ -435,14 +543,22 @@ function MultimodalRefPanel({ refs, onChange }: { refs: MultimodalRef[]; onChang
   function updateRole(id: string, role: RefRole) { onChange(refs.map((r) => r.id === id ? { ...r, role } : r)); }
 
   return (
-    <div className="grid grid-cols-3 gap-4">
-      {/* Images */}
-      <RefSection label="Images" count={images.length} max={M2V_MAX_IMAGES} onAdd={() => imgInput.current?.click()}>
-        {images.length > 0 && (
-          <div className="grid grid-cols-3 gap-1.5 mb-1.5">
+    <div className="space-y-4">
+
+      {/* Images — wrapping thumbnail grid */}
+      <div className="space-y-1.5">
+        <RefSectionHeader label="Images" count={images.length} max={M2V_MAX_IMAGES} onAdd={() => imgInput.current?.click()} />
+        {images.length === 0 ? (
+          <button onClick={() => imgInput.current?.click()}
+            className="w-full flex items-center justify-center gap-2 h-16 rounded-lg border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/40 transition-colors text-xs text-muted-foreground">
+            <Upload className="h-3.5 w-3.5" />
+            Add images
+          </button>
+        ) : (
+          <div className="flex flex-wrap gap-2">
             {images.map((ref) => (
-              <div key={ref.id} className="relative group">
-                <div className="aspect-square rounded-md overflow-hidden border border-border bg-muted">
+              <div key={ref.id} className="relative group h-16 w-16 shrink-0">
+                <div className="h-full w-full rounded-md overflow-hidden border border-border bg-muted">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img src={ref.dataBase64} alt={ref.fileName} className="w-full h-full object-cover" />
                 </div>
@@ -455,72 +571,146 @@ function MultimodalRefPanel({ refs, onChange }: { refs: MultimodalRef[]; onChang
                 >
                   <X className="h-2.5 w-2.5" />
                 </button>
-                <RoleSelect value={ref.role} mediaType="image" onChange={(r) => updateRole(ref.id, r)} />
               </div>
             ))}
             {images.length < M2V_MAX_IMAGES && (
               <button onClick={() => imgInput.current?.click()}
-                className="aspect-square rounded-md border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/50 flex items-center justify-center transition-colors">
+                className="h-16 w-16 shrink-0 rounded-md border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/50 flex items-center justify-center transition-colors">
                 <Upload className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
             )}
           </div>
         )}
         <input ref={imgInput} type="file" accept="image/*" multiple className="hidden"
-          onChange={(e) => addFiles(e.target.files, "image", M2V_MAX_IMAGES, "subject")} />
-      </RefSection>
+          onChange={(e) => addFiles(e.target.files, "image", M2V_MAX_IMAGES, "reference_image")} />
+      </div>
 
-      {/* Videos */}
-      <RefSection label="Videos" count={videos.length} max={M2V_MAX_VIDEOS} onAdd={() => vidInput.current?.click()}>
-        {videos.map((ref) => (
-          <MediaRow key={ref.id}
-            icon={<Film className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />}
-            label={getLabel(refs, ref.id)} fileName={ref.fileName} role={ref.role} mediaType="video"
-            onRoleChange={(r) => updateRole(ref.id, r)} onRemove={() => remove(ref.id)} />
-        ))}
+      {/* Videos — row list */}
+      <div className="space-y-1.5">
+        <RefSectionHeader label="Videos" count={videos.length} max={M2V_MAX_VIDEOS} onAdd={() => vidInput.current?.click()} />
+        {videos.length === 0 ? (
+          <button onClick={() => vidInput.current?.click()}
+            className="w-full flex items-center justify-center gap-2 h-16 rounded-lg border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/40 transition-colors text-xs text-muted-foreground">
+            <Upload className="h-3.5 w-3.5" />
+            Add videos
+          </button>
+        ) : (
+          <div className="space-y-1">
+            {videos.map((ref) => (
+              <MediaRow key={ref.id}
+                icon={<Film className="h-3.5 w-3.5 text-muted-foreground shrink-0" />}
+                label={getLabel(refs, ref.id)} fileName={ref.fileName} role={ref.role} mediaType="video"
+                onRoleChange={(r) => updateRole(ref.id, r)} onRemove={() => remove(ref.id)} />
+            ))}
+          </div>
+        )}
         <input ref={vidInput} type="file" accept="video/mp4,video/quicktime,video/webm" multiple className="hidden"
-          onChange={(e) => addFiles(e.target.files, "video", M2V_MAX_VIDEOS, "motion")} />
-      </RefSection>
+          onChange={(e) => addFiles(e.target.files, "video", M2V_MAX_VIDEOS, "reference_video")} />
+      </div>
 
-      {/* Audio */}
-      <RefSection label="Audio" count={audios.length} max={M2V_MAX_AUDIO} onAdd={() => audInput.current?.click()}>
-        {audios.map((ref) => (
-          <MediaRow key={ref.id}
-            icon={<Music className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />}
-            label={getLabel(refs, ref.id)} fileName={ref.fileName} role={ref.role} mediaType="audio"
-            onRoleChange={(r) => updateRole(ref.id, r)} onRemove={() => remove(ref.id)} />
-        ))}
+      {/* Audio — row list */}
+      <div className="space-y-1.5">
+        <RefSectionHeader label="Audio" count={audios.length} max={M2V_MAX_AUDIO} onAdd={() => audInput.current?.click()} />
+        {audios.length === 0 ? (
+          <button onClick={() => audInput.current?.click()}
+            className="w-full flex items-center justify-center gap-2 h-16 rounded-lg border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/40 transition-colors text-xs text-muted-foreground">
+            <Upload className="h-3.5 w-3.5" />
+            Add audio
+          </button>
+        ) : (
+          <div className="space-y-1">
+            {audios.map((ref) => (
+              <MediaRow key={ref.id}
+                icon={<Music className="h-3.5 w-3.5 text-muted-foreground shrink-0" />}
+                label={getLabel(refs, ref.id)} fileName={ref.fileName} role={ref.role} mediaType="audio"
+                onRoleChange={(r) => updateRole(ref.id, r)} onRemove={() => remove(ref.id)} />
+            ))}
+          </div>
+        )}
         <input ref={audInput} type="file" accept="audio/mpeg,audio/wav,audio/mp3,audio/*" multiple className="hidden"
-          onChange={(e) => addFiles(e.target.files, "audio", M2V_MAX_AUDIO, "audio")} />
-      </RefSection>
+          onChange={(e) => addFiles(e.target.files, "audio", M2V_MAX_AUDIO, "reference_audio")} />
+      </div>
     </div>
   );
 }
 
-function RefSection({ label, count, max, onAdd, children }: {
-  label: string; count: number; max: number; onAdd: () => void; children: React.ReactNode;
+// ── FrameUploadPanel — first / last frame slots for I2V ───────────────────────
+
+function FrameUploadPanel({ firstFrame, lastFrame, onFirstFrame, onLastFrame }: {
+  firstFrame: string | null;
+  lastFrame: string | null;
+  onFirstFrame: (src: string | null) => void;
+  onLastFrame: (src: string | null) => void;
 }) {
   return (
+    <div className="grid grid-cols-2 gap-3">
+      <FrameSlot label="First frame" required value={firstFrame} onChange={onFirstFrame} />
+      <FrameSlot label="Last frame" value={lastFrame} onChange={onLastFrame} />
+    </div>
+  );
+}
+
+function FrameSlot({ label, required, value, onChange }: {
+  label: string;
+  required?: boolean;
+  value: string | null;
+  onChange: (src: string | null) => void;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+
+  function handleFile(file: File | undefined) {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (e) => onChange(e.target?.result as string);
+    reader.readAsDataURL(file);
+  }
+
+  return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center gap-1.5">
         <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">{label}</span>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-mono text-muted-foreground/60 tabular-nums">{count}/{max}</span>
-          {count < max && (
-            <button onClick={onAdd} className="text-[10px] font-mono text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2">
-              + add
-            </button>
-          )}
-        </div>
+        {required && <span className="text-[10px] font-mono text-muted-foreground/40">required</span>}
       </div>
-      {children}
-      {count === 0 && (
-        <button onClick={onAdd}
-          className="w-full flex items-center justify-center gap-2 h-16 rounded-lg border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/40 transition-colors text-xs text-muted-foreground">
-          <Upload className="h-3.5 w-3.5" />
-          Add {label.toLowerCase()}
+      {value ? (
+        <div className="relative group aspect-square rounded-md overflow-hidden border border-border bg-muted">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={value} alt={label} className="w-full h-full object-cover" />
+          <button
+            onClick={() => { onChange(null); if (input.current) input.current.value = ""; }}
+            className="absolute top-1 right-1 rounded-full bg-black/60 p-0.5 text-white hover:bg-black/80 opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={() => input.current?.click()}
+          className="aspect-square w-full rounded-md border-2 border-dashed border-border hover:border-foreground/30 hover:bg-muted/40 flex flex-col items-center justify-center gap-1.5 transition-colors"
+        >
+          <Upload className="h-4 w-4 text-muted-foreground" />
+          <span className="text-[10px] text-muted-foreground/60">Upload</span>
         </button>
       )}
+      <input ref={input} type="file" accept="image/*" className="hidden"
+        onChange={(e) => { handleFile(e.target.files?.[0]); }} />
+    </div>
+  );
+}
+
+function RefSectionHeader({ label, count, max, onAdd }: {
+  label: string; count: number; max: number; onAdd: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">{label}</span>
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-mono text-muted-foreground/60 tabular-nums">{count}/{max}</span>
+        {count > 0 && count < max && (
+          <button onClick={onAdd} className="text-[10px] font-mono text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2">
+            + add
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -531,12 +721,12 @@ function MediaRow({ icon, label, fileName, role, mediaType, onRoleChange, onRemo
   onRoleChange: (r: RefRole) => void; onRemove: () => void;
 }) {
   return (
-    <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 mb-1">
+    <div className="flex items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1.5 mb-1">
       {icon}
-      <span className="text-[10px] font-mono bg-muted rounded px-1 py-0.5 text-muted-foreground flex-shrink-0">{label}</span>
-      <span className="text-xs text-muted-foreground truncate flex-1 min-w-0">{fileName}</span>
+      <span className="text-[10px] font-mono bg-muted rounded px-1 py-0.5 text-muted-foreground shrink-0">{label}</span>
+      <span className="text-[10px] text-muted-foreground truncate flex-1 min-w-0">{fileName}</span>
       <RoleSelect value={role} mediaType={mediaType} onChange={onRoleChange} />
-      <button onClick={onRemove} className="text-muted-foreground hover:text-foreground transition-colors flex-shrink-0">
+      <button onClick={onRemove} className="text-muted-foreground hover:text-foreground transition-colors shrink-0">
         <X className="h-3 w-3" />
       </button>
     </div>
@@ -549,17 +739,16 @@ function RoleSelect({ value, mediaType, onChange }: {
   onChange: (r: RefRole) => void;
 }) {
   const options = REF_ROLES_BY_TYPE[mediaType];
-  // Single-option types (video → motion, audio → audio): show as a static badge
   if (options.length === 1) {
     return (
-      <span className="text-[10px] font-mono rounded border border-border bg-muted text-muted-foreground px-1.5 py-0.5 flex-shrink-0">
+      <span className="text-[10px] font-mono rounded border border-border bg-muted text-muted-foreground px-1.5 py-0.5 shrink-0">
         {options[0].label}
       </span>
     );
   }
   return (
     <select value={value} onChange={(e) => onChange(e.target.value as RefRole)}
-      className="text-[10px] font-mono rounded border border-border bg-background text-muted-foreground px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-ring flex-shrink-0 cursor-pointer"
+      className="text-[10px] font-mono rounded border border-border bg-background text-muted-foreground px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-ring shrink-0 cursor-pointer"
       onClick={(e) => e.stopPropagation()}>
       {options.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
     </select>
@@ -568,37 +757,22 @@ function RoleSelect({ value, mediaType, onChange }: {
 
 // ── Shared primitives ──────────────────────────────────────────────────────────
 
-function ModeGroup({ label, badge, modes, active, onSelect }: {
-  label: string; badge: string; modes: Mode[];
-  active: Mode; onSelect: (m: Mode) => void;
-}) {
+function ModeTab({ mode, active, onSelect }: { mode: Mode; active: boolean; onSelect: (m: Mode) => void }) {
+  const cfg = MODES[mode];
+  const Icon = cfg.icon;
   return (
-    <div className="space-y-0.5">
-      <div className="px-3 mb-2">
-        <p className="text-xs font-semibold text-foreground/80 tracking-tight">{label}</p>
-        <span className="inline-flex items-center rounded-sm px-1.5 py-px text-[10px] font-mono bg-muted text-muted-foreground mt-1">
-          {badge}
-        </span>
-      </div>
-      {modes.map((m) => {
-        const cfg = MODES[m];
-        const Icon = cfg.icon;
-        const isActive = active === m;
-        return (
-          <button key={m} onClick={() => onSelect(m)}
-            className={cn(
-              "w-full flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-all relative",
-              isActive
-                ? "bg-foreground/[0.06] text-foreground font-medium"
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/60",
-            )}>
-            {isActive && <span className="absolute left-0 top-1/2 -translate-y-1/2 h-4 w-[2px] rounded-r-full bg-foreground" />}
-            <Icon className={cn("h-3.5 w-3.5 flex-shrink-0", isActive ? "text-foreground" : "text-muted-foreground")} />
-            <span>{cfg.label}</span>
-          </button>
-        );
-      })}
-    </div>
+    <button
+      onClick={() => onSelect(mode)}
+      className={cn(
+        "flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all",
+        active
+          ? "bg-foreground text-background"
+          : "text-muted-foreground hover:text-foreground hover:bg-muted",
+      )}
+    >
+      <Icon className="h-3 w-3 shrink-0" />
+      {cfg.label}
+    </button>
   );
 }
 
@@ -606,7 +780,7 @@ function ControlBlock({ label, badge, children }: { label: string; badge?: strin
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
-        <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">{label}</span>
+        <span className="text-xs font-mono text-muted-foreground uppercase tracking-widest">{label}</span>
         {badge && <span className="text-[10px] font-mono text-muted-foreground/60 tabular-nums">{badge}</span>}
       </div>
       {children}
@@ -659,16 +833,22 @@ interface OutputAreaProps {
 function OutputArea({ status, results, error, count, aspectRatio, isVideoMode, onRetry, onDownload }: OutputAreaProps) {
   if (status === "idle") {
     return (
-      <div className="flex flex-col items-center justify-center h-full text-center gap-4 p-8">
-        <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-muted">
+      <div
+        className="flex flex-col items-center justify-center h-full text-center gap-4 p-8"
+        style={{
+          backgroundImage: "radial-gradient(circle, oklch(0 0 0 / 5%) 1px, transparent 1px)",
+          backgroundSize: "20px 20px",
+        }}
+      >
+        <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-card border border-border shadow-sm">
           {isVideoMode ? <Film className="h-9 w-9 text-muted-foreground" /> : <Wand2 className="h-9 w-9 text-muted-foreground" />}
         </div>
         <div className="space-y-1">
           <p className="text-sm font-medium">{isVideoMode ? "No video yet" : "No images yet"}</p>
           <p className="text-sm text-muted-foreground max-w-xs">
             {isVideoMode
-              ? "Set up your references and prompt above, then click Generate."
-              : "Write a prompt above and click Generate to create your first image."}
+              ? "Set up your references and prompt, then click Generate."
+              : "Write a prompt and click Generate to create your first image."}
           </p>
         </div>
       </div>
