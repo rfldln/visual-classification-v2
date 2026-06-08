@@ -3,7 +3,7 @@ export const CATEGORIES = [
   { id: "bbg",      label: "B/B/G",     description: "Two male performers with one female performer",             group: "partnered" },
   { id: "bg",       label: "B/G",       description: "One male and one female performer, standard partnered content", group: "partnered" },
   { id: "bgg",      label: "B/G/G",     description: "One male performer with two female performers",              group: "partnered" },
-  { id: "blowjob",  label: "BJ",        description: "Oral sex performed on a male performer",                     group: "acts" },
+  { id: "blowjob",  label: "BJ",        description: "A FEMALE performer uses her mouth to perform oral sex on a MALE performer's penis. Male-on-female oral (cunnilingus) is NEVER blowjob — omit it entirely.",  group: "acts" },
   { id: "butt",     label: "Butt",      description: "Content showcasing the butt, no penetration",                group: "body" },
   { id: "creampie", label: "Cream Pie", description: "Partnered content ending with an internal finish",           group: "acts" },
   { id: "feet",     label: "Feet",      description: "Content focused on feet, showing or close-ups",              group: "body" },

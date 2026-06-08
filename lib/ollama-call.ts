@@ -216,23 +216,31 @@ export async function submitRunPodJob(opts: {
   systemPrompt: string;
   userText: string;
   imageBase64s: string[];
+  maxTokens?: number;
+  // Qwen3 thinking models otherwise spend their whole budget inside a <think>
+  // trace and never emit the JSON answer. Sent as an OpenAI extra body field,
+  // which the worker-vllm /v1/chat/completions route forwards to vLLM.
+  disableThinking?: boolean;
 }): Promise<{ ok: true; jobId: string } | OllamaCallErr> {
   const userContent: unknown[] = [{ type: "text", text: opts.userText }];
   for (const b64 of opts.imageBase64s) {
     userContent.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } });
   }
+  const openaiInput: Record<string, unknown> = {
+    model: opts.model,
+    messages: [
+      { role: "system", content: opts.systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    stream: false,
+    temperature: 0.1,
+  };
+  if (opts.maxTokens != null) openaiInput.max_tokens = opts.maxTokens;
+  if (opts.disableThinking) openaiInput.chat_template_kwargs = { enable_thinking: false };
   const payload = {
     input: {
       openai_route: "/v1/chat/completions",
-      openai_input: {
-        model: opts.model,
-        messages: [
-          { role: "system", content: opts.systemPrompt },
-          { role: "user", content: userContent },
-        ],
-        stream: false,
-        temperature: 0.1,
-      },
+      openai_input: openaiInput,
     },
   };
 

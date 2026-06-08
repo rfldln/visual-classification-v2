@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { callOllama, submitRunPodJob, DEFAULT_OLLAMA_MODEL } from "@/lib/ollama-call";
-import { buildGrokSystemPrompt, filterGrokTags, parseGrokResponse } from "@/lib/grok";
+import { buildGrokSystemPrompt, applyTaxonomyRules, parseGrokResponse } from "@/lib/grok";
 import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
@@ -108,7 +108,7 @@ export async function POST(req: Request) {
 
     const cleaned = result.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
     const parsed = parseGrokResponse(cleaned);
-    parsed.tags = filterGrokTags(parsed.tags);
+    parsed.tags = applyTaxonomyRules(parsed.tags, parsed.performers);
 
     return NextResponse.json({
       kind,

@@ -35,6 +35,12 @@ const serverEnvSchema = z.object({
   OLLAMA_MODEL: z.string().min(1).optional(),
   RUNPOD_API_KEY: z.string().min(1).optional(),
   RUNPOD_ENDPOINT_ID: z.string().min(1).optional(),
+  // Serverless RunPod vLLM endpoint serving Qwen3-VL-30B-A3B (production fallback).
+  RUNPOD_QWEN_ENDPOINT_ID: z.string().min(1).optional(),
+
+  // ── Qwen 2.5 VL Pod (optional — RunPod pod running vLLM) ─────────────────
+  QWEN25_POD_URL: z.string().url().optional(),
+  QWEN25_POD_API_KEY: z.string().min(1).optional(),
 
   // ── Cloudflare R2 (optional — using Supabase Storage instead for now) ──────
   R2_ACCOUNT_ID: z.string().min(1).optional(),

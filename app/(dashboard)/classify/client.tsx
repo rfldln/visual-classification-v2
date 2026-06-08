@@ -3,13 +3,15 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { GrokTab } from "@/components/classify/grok-tab";
-import { OllamaTab } from "@/components/classify/ollama-tab";
+import { ServerlessTab } from "@/components/classify/serverless-tab";
+import { TestingTab } from "@/components/classify/testing-tab";
 
-type Tab = "grok" | "ollama";
+type Tab = "grok" | "serverless" | "testing";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "grok",   label: "Grok" },
-  { id: "ollama", label: "Qwen" },
+  { id: "grok",       label: "Grok" },
+  { id: "serverless", label: "Serverless" },
+  { id: "testing",    label: "Testing" },
 ];
 
 export function ClassifyClient() {
@@ -51,8 +53,9 @@ export function ClassifyClient() {
 
       {/* Tab content */}
       <div className="px-8 py-6">
-        {activeTab === "grok"   && <GrokTab />}
-        {activeTab === "ollama" && <OllamaTab />}
+        {activeTab === "grok"       && <GrokTab />}
+        {activeTab === "serverless" && <ServerlessTab />}
+        {activeTab === "testing"    && <TestingTab />}
       </div>
     </div>
   );

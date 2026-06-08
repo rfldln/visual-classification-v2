@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { callOpenRouterGrok, DEFAULT_GROK_MODEL } from "@/lib/grok-call";
-import { buildGrokSystemPrompt, parseGrokResponse, applyTaxonomyRules } from "@/lib/grok";
+import { callQwen25Pod, DEFAULT_QWEN25_MODEL } from "@/lib/qwen25-call";
+import { buildGrokSystemPrompt, parseGrokResponse, applyTaxonomyRules, PERCEPTION_ADDENDUM } from "@/lib/grok";
 import { env } from "@/lib/env";
 
 export const runtime = "nodejs";
@@ -20,9 +20,9 @@ export async function POST(req: Request) {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const apiKey = env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json({ error: "OPENROUTER_API_KEY not configured." }, { status: 503 });
+  const podUrl = env.QWEN25_POD_URL;
+  if (!podUrl) {
+    return NextResponse.json({ error: "Qwen 2.5 pod is not configured. Set QWEN25_POD_URL in .env.local." }, { status: 503 });
   }
 
   try {
@@ -30,7 +30,7 @@ export async function POST(req: Request) {
     const filename = (form.get("filename") as string) || "upload";
     const kind = (form.get("kind") as string) || "image";
     const modelOverride = (form.get("model") as string) || "";
-    const model = modelOverride.trim() || env.OPENROUTER_GROK_MODEL || DEFAULT_GROK_MODEL;
+    const model = modelOverride.trim() || DEFAULT_QWEN25_MODEL;
 
     const frames: File[] = [];
     const single = form.get("image");
@@ -56,37 +56,39 @@ export async function POST(req: Request) {
     const userText =
       kind === "video"
         ? [
-            `Tag this video. The image is a two-section contact sheet (grid, left-to-right top-to-bottom, cell numbers shown):`,
-            `SECTION 1 (cells 1–${mainCount}): ${mainCount} frames sampled evenly across the FULL video. Early cells may be non-sexual intro/dialogue — acts appear in later cells.`,
+            `Tag this video. You are given ${frameCount} separate frames in chronological order (frame 1 = start, frame ${frameCount} = end).`,
+            `The first ${mainCount} frames are sampled evenly across the FULL video — early frames may be non-sexual intro/dialogue, acts appear in later frames.`,
             endCount > 0
-              ? `SECTION 2 (cells ${mainCount + 1}–${frameCount}, marked with yellow "END ZONE" divider): ${endCount} frames densely sampled from the LAST 15% of the video at ~2s intervals. This is where creampie and squirt most often occur — examine these cells carefully for those tags.`
+              ? `The last ${endCount} frames are densely sampled from the LAST 15% of the video at ~2s intervals. This is where creampie and squirt most often occur — examine them carefully for those tags.`
               : null,
-            `Examine EVERY cell. Use the most explicit/partnered tags found anywhere. JSON only.`,
+            `Examine EVERY frame. Count distinct performers across ALL frames combined. Use the most explicit/partnered tags found anywhere. JSON only.`,
           ].filter(Boolean).join(" ")
-        : "Tag this image. JSON only.";
+        : "Tag this SINGLE still image. It is NOT a video — there are no frames. Do NOT reference frame numbers in your evidence; describe only what is visible in this one image. JSON only.";
 
-    const grok = await callOpenRouterGrok({
-      apiKey,
+    const result = await callQwen25Pod({
+      podUrl,
+      apiKey: env.QWEN25_POD_API_KEY,
       model,
-      systemPrompt: buildGrokSystemPrompt(),
+      systemPrompt: buildGrokSystemPrompt() + PERCEPTION_ADDENDUM,
       userText,
       imageDataUrls,
     });
-    if (!grok.ok) {
-      return NextResponse.json({ error: `OpenRouter: ${grok.error}` }, { status: grok.status });
+
+    if (!result.ok) {
+      return NextResponse.json({ error: `Qwen 2.5: ${result.error}` }, { status: result.status });
     }
 
-    const parsed = parseGrokResponse(grok.content);
+    const parsed = parseGrokResponse(result.content);
     const tags = applyTaxonomyRules(parsed.tags, parsed.performers);
     return NextResponse.json({
       kind,
       filename,
       model,
       frames: kind === "video" ? frameCount : undefined,
-      usage: grok.usage ?? null,
+      usage: result.usage ?? null,
       ...parsed,
       tags,
-      raw: parsed.raw ?? grok.content,
+      raw: parsed.raw ?? result.content,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
