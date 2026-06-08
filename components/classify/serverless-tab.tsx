@@ -14,5 +14,5 @@ const SERVERLESS_MODELS: TaggerModel[] = [
 ];
 
 export function ServerlessTab() {
-  return <TaggerPanel serviceName="Serverless" models={SERVERLESS_MODELS} endpoint="/api/serverless-tag" />;
+  return <TaggerPanel serviceName="Serverless" models={SERVERLESS_MODELS} endpoint="/api/serverless-tag" coldStartHint />;
 }
