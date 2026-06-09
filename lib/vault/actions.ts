@@ -99,3 +99,24 @@ export async function deleteVaultItem(itemId: string): Promise<ActionResult> {
   revalidatePath("/vault");
   return { ok: true };
 }
+
+export async function clearVault(): Promise<ActionResult> {
+  const user = await getCurrentUser();
+  if (!user) return { ok: false, error: "Unauthorized" };
+
+  const items = await db.query.vaultItems.findMany({
+    where: eq(vaultItems.userId, user.id),
+    columns: { storageKey: true },
+  });
+
+  if (items.length > 0) {
+    await supabaseAdmin.storage
+      .from("vault")
+      .remove(items.map((i) => i.storageKey));
+    await db.delete(vaultItems).where(eq(vaultItems.userId, user.id));
+  }
+
+  revalidatePath("/vault");
+  revalidatePath("/dashboard");
+  return { ok: true };
+}
